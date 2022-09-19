@@ -1,0 +1,233 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+var app = require("../app");
+var debug = require("debug")("prodax:server");
+var http = require("http");
+var fs = require("fs");
+var ss = require("socket.io-stream");
+var path = require("path");
+const mongoose = require('mongoose');
+const { BlobServiceClient } = require("@azure/storage-blob");
+
+const userModel = require("../schemas/user");
+const videoModel = require("../schemas/video");
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT || "3000");
+app.set("port", port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+
+var io = require("socket.io")(server, {
+  cors: {
+    origin: "http://localhost:4200",
+  },
+});
+
+var connCounter = 0;
+var firstOne;
+var secondOne;
+
+
+function makeid(length) {
+  var result           = '';
+  var characters       = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var charactersLength = characters.length;
+  for ( var i = 0; i < length; i++ ) {
+    result += characters.charAt(Math.floor(Math.random() * 
+charactersLength));
+ }
+ return result;
+}
+
+io.of("/upload").on("connection", async function (socket) {
+
+  ss(socket).on("upload", async function (stream, data) {
+
+    var filename = path.basename(data.name);
+    filename = makeid(10) + filename
+
+    // Create the BlobServiceClient object which will be used to create a container client
+    const blobServiceClient = BlobServiceClient.fromConnectionString(
+      "DefaultEndpointsProtocol=https;AccountName=prodaxstorageaccount;AccountKey=48YwLyJ4SI/4wbdSgIYZOEPOBVLRU8g5wHyirbs11K18KGn63ANc5o/DsyxeK/kdGa81DVkm7PR6+AStVze2Ow==;EndpointSuffix=core.windows.net"
+    );
+
+    const containerName = "prodaxcontainer";
+
+    // upload options
+    const uploadOptions = {
+      // not indexed for searching
+      metadata: {
+        owner: "Shehan",
+      },
+
+      // indexed for searching
+      tags: {
+        createdBy: "Shehan",
+        createdWith: `StorageSnippetsForDocs-${1}`,
+        createdOn: new Date().toDateString(),
+      },
+    };
+
+    // Get a reference to a container
+    const containerClient = blobServiceClient.getContainerClient(containerName);
+    const storedDocumentData = await createBlobFromReadStream(
+      containerClient,
+      filename,
+      stream,
+      uploadOptions
+    );
+
+    let videoDetails;
+
+    videoDetails = new videoModel({
+      thumbNailMetaData: storedDocumentData.tags,
+      cdnUrlThumbnail: storedDocumentData.cdnLocation,
+      fileName:filename,
+      videoTitle: data.videoTitle,
+      videoDescription: data.videoDescription,
+    });
+
+    if (data.pull) {
+      await videoModel.updateOne({ '_id': data.pull }, {
+        "videoMetaDta": storedDocumentData.tags,
+        "cdnUrlVideo": storedDocumentData.cdnLocation,
+        fileName:filename,
+      });
+    } else {
+      await videoDetails.save((err, doc) => {
+        if (!err) {
+          if (data.pull) {
+            socket.emit("thumbnailUploadReply", false);
+            console.log(doc.id, "connection success");
+          } else {
+            socket.emit("thumbnailUploadReply", doc.id);
+            console.log(doc.id, "connection success");
+          }
+        } else {
+          socket.emit("thumbnailUploadReply", false);
+          console.log("connection failed", err);
+        }
+      });
+
+    }
+
+
+  });
+});
+
+async function createBlobFromReadStream(
+  containerClient,
+  blobName,
+  readableStream,
+  uploadOptions
+) {
+  // Create blob client from container client
+  const blockBlobClient = await containerClient.getBlockBlobClient(blobName);
+
+  // Size of every buffer allocated, also
+  // the block size in the uploaded block blob.
+  // Default value is 8MB
+  const bufferSize = 4 * 1024 * 1024;
+
+  // Max concurrency indicates the max number of
+  // buffers that can be allocated, positive correlation
+  // with max uploading concurrency. Default value is 5
+  const maxConcurrency = 20;
+
+  // use transform per chunk - only to see chunck
+  // const transformedReadableStream = readableStream.pipe(myTransform);
+
+  // Upload stream
+  await blockBlobClient.uploadStream(
+    readableStream,
+    bufferSize,
+    maxConcurrency,
+    uploadOptions
+  );
+
+  // do something with blob
+  const getTagsResponse = await blockBlobClient.getTags();
+  // const resData =  {`tags for ${blobName} = ${JSON.stringify(getTagsResponse.tags)}, https://prodax-bfhqcyhwfmbnh8g9.z01.azurefd.net/prodaxcontainer/${blobName}`;
+  // console.log(resData);
+
+  return {
+    tags: getTagsResponse,
+    cdnLocation: `https://prodax-bfhqcyhwfmbnh8g9.z01.azurefd.net/prodaxcontainer/${blobName}`,
+  };
+}
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+
+server.listen(port);
+server.on("error", onError);
+server.on("listening", onListening);
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== "listen") {
+    throw error;
+  }
+
+  var bind = typeof port === "string" ? "Pipe " + port : "Port " + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case "EACCES":
+      console.error(bind + " requires elevated privileges");
+      process.exit(1);
+      break;
+    case "EADDRINUSE":
+      console.error(bind + " is already in use");
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === "string" ? "pipe " + addr : "port " + addr.port;
+  debug("Listening on " + bind);
+}
